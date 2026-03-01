@@ -1,13 +1,13 @@
 # SRL GRPO training config for Qwen2.5-7B-Instruct
 
-model: Qwen/Qwen2.5-7B-Instruct
+model: Qwen/Qwen2.5-3B-Instruct
 data: data/srl_train.jsonl
 val_data: data/srl_val.jsonl
-output_dir: checkpoints/srl_qwen7b
+output_dir: checkpoints/srl/step_500
 
-num_steps: 500
+num_steps: 100
 batch_size: 4
-group_size: 8
+group_size: 4
 
 max_new_tokens: 512
 temperature: 1.0
@@ -17,6 +17,6 @@ clip_epsilon: 0.2
 eps_std: 0.01
 kl_coef: 0.0
 
-checkpoint_every: 100
-eval_every: 50
+checkpoint_every: 10
+eval_every: 5
 seed: 42

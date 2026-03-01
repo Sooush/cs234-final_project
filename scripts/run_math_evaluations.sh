@@ -26,9 +26,12 @@ echo "Step 1: Running evaluations..."
 
 python -m src.eval_all_benchmarks \
   --models base \
-  --benchmarks aime24 aime25 \
-  --modes greedy avg32 \
+  --benchmarks minerva_math \
+  --modes greedy avg1 \
   --max-gen-toks 4096 \
+  --results-dir results-0228-0216 \
+  --checkpoint-file results-0228-0216/eval_checkpoint.json \
+  --cache-dir /mnt/persistent/lm_eval_cache \
   --config configs/models_config.json
 
 

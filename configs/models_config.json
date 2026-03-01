@@ -1,6 +1,6 @@
 {
   "description": "Model configuration for comprehensive evaluation based on SRL paper parameters",
-  "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "base_model": "Qwen/Qwen2.5-3B-Instruct",
   "models": {
     "base": {
       "model_name": null,

@@ -1,6 +1,7 @@
 """
-RLVR (outcome-based GRPO) training script.
+RLVR (outcome-based GRPO) training script with LoRA.
 
+Uses LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning.
 
 - batch size ≈ 128 (prompts)
 - learning_rate = 5e-7
@@ -8,6 +9,8 @@ RLVR (outcome-based GRPO) training script.
 - rollout number (num_generations) = 8
 - KL loss coeff (beta) = 0.0
 - dtype = bf16 (if available)
+- LoRA rank = 16 (default)
+- LoRA alpha = 32 (default)
 
 This script can be run:
 1. After SRL training, using the SRL checkpoint as initialization:
@@ -20,8 +23,8 @@ This script can be run:
      --output-dir checkpoints/srl_rlvr
 
 After training, point `configs/models_config.json["models"]["srl_rlvr"]["model_path"]`
-to the RLVR checkpoint directory (e.g. `checkpoints/srl_rlvr`) so that the
-existing evaluation pipeline can pick it up.
+to the RLVR checkpoint directory (e.g. `checkpoints/srl_rlvr` or `checkpoints/srl_rlvr_merged`) 
+so that the existing evaluation pipeline can pick it up.
 """
 
 from __future__ import annotations
@@ -31,7 +34,8 @@ from dataclasses import dataclass
 from typing import Dict, Any
 
 from datasets import load_dataset
-from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, get_peft_model, TaskType
 from trl import GRPOTrainer, GRPOConfig
 import torch
 
@@ -51,9 +55,9 @@ class RLVRConfig:
 
     # Paper hyperparameters (Table 6)
     learning_rate: float = 5e-7
-    batch_size: int = 128
-    num_generations: int = 8
-    num_train_epochs: int = 3  # paper uses steps; epochs is a practical proxy
+    batch_size: int = 4
+    num_generations: int = 4
+    num_train_epochs: int = 2  # paper uses steps; epochs is a practical proxy
     beta: float = 0.0  # KL coeff
 
 
@@ -83,37 +87,46 @@ def extract_final_answer(text: str) -> str:
     return numbers[-1] if numbers else ""
 
 
-def accuracy_reward_func(samples: list[Dict[str, Any]]) -> list[float]:
+def create_accuracy_reward_func(dataset):
     """
-    Simple RLVR reward: 1.0 if final answer matches ground truth, else 0.0.
-
-    The GRPOTrainer in TRL v0.28.0 will call this with a list of dicts containing:
-      - "prompt": str
-      - "completion": str (model-generated completion)
-      - The dataset's "completion" column contains the ground truth solution
+    Create an accuracy reward function that has access to the dataset for ground truth.
+    
+    The GRPOTrainer in TRL v0.28.0 calls reward functions with:
+      - prompts: list of prompt strings (keyword argument)
+      - completions: list of model-generated completion strings (keyword argument)
+      - Additional kwargs may contain metadata
     """
-    rewards: list[float] = []
-    for s in samples:
-        # Model-generated completion
-        model_completion: str = s.get("completion", "")
+    # Create a mapping from prompt to ground truth completion
+    prompt_to_gt = {}
+    for example in dataset:
+        prompt = build_prompt(example)
+        gt_completion = example.get("solution", "")
+        prompt_to_gt[prompt] = gt_completion
+    
+    def accuracy_reward_func(prompts=None, completions=None, **kwargs):
+        """
+        Simple RLVR reward: 1.0 if final answer matches ground truth, else 0.0.
+        """
+        if prompts is None:
+            prompts = []
+        if completions is None:
+            completions = []
         
-        # Ground truth is stored in the dataset's "completion" column
-        # In TRL v0.28.0, the original dataset row might be in metadata
-        # or we need to compare against the dataset's completion column
-        # For now, we'll extract from the sample's original data
-        # Note: This may need adjustment based on how TRL v0.28.0 passes data
-        ground_truth: str = ""
-        if "metadata" in s and isinstance(s["metadata"], dict):
-            ground_truth = s["metadata"].get("completion", "")
-        elif "original_completion" in s:
-            ground_truth = s["original_completion"]
+        rewards: list[float] = []
         
-        # Extract final answers
-        gt = extract_final_answer(ground_truth)
-        pred = extract_final_answer(model_completion)
-
-        rewards.append(1.0 if gt and pred == gt else 0.0)
-    return rewards
+        for i, (prompt, completion) in enumerate(zip(prompts, completions)):
+            # Get ground truth from the dataset mapping
+            ground_truth = prompt_to_gt.get(prompt, "")
+            
+            # Extract final answers
+            gt = extract_final_answer(ground_truth)
+            pred = extract_final_answer(completion)
+            
+            rewards.append(1.0 if gt and pred == gt else 0.0)
+        
+        return rewards
+    
+    return accuracy_reward_func
 
 
 def main() -> None:
@@ -148,6 +161,39 @@ def main() -> None:
         type=int,
         default=256,
         help="Optional: limit number of eval samples",
+    )
+    parser.add_argument(
+        "--lora-r",
+        type=int,
+        default=16,
+        help="LoRA rank (default: 16)",
+    )
+    parser.add_argument(
+        "--lora-alpha",
+        type=int,
+        default=32,
+        help="LoRA alpha scaling parameter (default: 32)",
+    )
+    parser.add_argument(
+        "--lora-dropout",
+        type=float,
+        default=0.05,
+        help="LoRA dropout rate (default: 0.05)",
+    )
+    parser.add_argument(
+        "--no-lora",
+        action="store_true",
+        help="Disable LoRA and use full fine-tuning",
+    )
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Path to a checkpoint directory to resume RLVR training from "
+            "(e.g. checkpoints/srl_rlvr/checkpoint-50). "
+            "If not set, training starts from scratch in output_dir."
+        ),
     )
 
     args = parser.parse_args()
@@ -205,25 +251,75 @@ def main() -> None:
     train_dataset = raw_train.map(map_to_prompts)
     eval_dataset = raw_eval.map(map_to_prompts)
 
-    # 2. Model loading config
-    # Note: Quantization cannot be used for fine-tuning base models
-    # Quantized models require PEFT adapters for training
-    # We only use quantization if explicitly needed for checkpoint loading (disabled by default)
+    # Create reward function with access to the dataset for ground truth matching
+    accuracy_reward_func = create_accuracy_reward_func(raw_train)
+
+    # 2. Load model and apply LoRA (if enabled)
+    # Try to load from init_from, fallback to base model if it fails
+    print(f"Attempting to load model from: {init_from}")
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            init_from,
+            dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16,
+            trust_remote_code=True,
+            device_map="auto" if torch.cuda.is_available() else None,
+        )
+        print(f"Successfully loaded model from: {init_from}")
+    except Exception as e:
+        print(f"Failed to load model from '{init_from}': {e}")
+        print(f"Falling back to base model: {base_model}")
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16,
+            trust_remote_code=True,
+            device_map="auto" if torch.cuda.is_available() else None,
+        )
+        print(f"Successfully loaded base model: {base_model}")
+    
+    if not args.no_lora:
+        # Configure LoRA for Qwen models
+        # Target attention and MLP layers
+        print("Applying LoRA")
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+        # For Qwen models, also target MLP layers if they exist
+        try:
+            # Check if model has gate_proj, up_proj, down_proj (typical for Qwen)
+            first_layer = next(iter(model.model.layers)) if hasattr(model, 'model') else None
+            if first_layer and hasattr(first_layer, 'mlp'):
+                if hasattr(first_layer.mlp, 'gate_proj'):
+                    target_modules.extend(["gate_proj", "up_proj", "down_proj"])
+        except Exception as e:
+            print(f"Error in target modules: {e}")
+            pass
+        
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+        )
+        
+        print(f"Applying LoRA with rank={args.lora_r}, alpha={args.lora_alpha}, dropout={args.lora_dropout}")
+        print(f"Target modules: {target_modules}")
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+    else:
+        print("Using full fine-tuning (LoRA disabled)")
+
+    # Enable gradient checkpointing to reduce memory usage
+    print("Disabling use_cache and enabling gradient checkpointing")
+    model.use_cache = False
+    model.gradient_checkpointing_enable()
+
+    # 3. Model loading config for GRPOConfig (if needed)
     model_kwargs = {
         "dtype": torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16,
         "low_cpu_mem_usage": True,
     }
-    
-    # Quantization is disabled to allow full fine-tuning
-    # If memory is constrained, consider using gradient checkpointing or smaller batch sizes instead
-    # quantization_config = BitsAndBytesConfig(
-    #     load_in_4bit=True,
-    #     bnb_4bit_compute_dtype=torch.float16,
-    #     bnb_4bit_quant_type="nf4",
-    # )
-    # model_kwargs["quantization_config"] = quantization_config
 
-    # 3. GRPO training configuration (match Table 6)
+    # 4. GRPO training configuration (match Table 6)
     # Paper hyperparameters (Table 6):
     # - batch size ≈ 128 (prompts)
     # - learning_rate = 5e-7
@@ -234,13 +330,17 @@ def main() -> None:
     
     per_device_train_batch_size = 1
     gradient_accumulation_steps = cfg.batch_size // per_device_train_batch_size
+    print(f"Per device train batch size: {per_device_train_batch_size}")
+    print(f"Batch size: {cfg.batch_size}")
+    print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
 
     # GRPOConfig in TRL v0.28.0 extends TrainingArguments
     # Note: model is passed to GRPOTrainer, not to GRPOConfig
     training_args = GRPOConfig(
         output_dir=cfg.output_dir,
-        logging_steps=10,
-        log_level="info",
+        logging_steps=10,  # Log every 10 steps
+        logging_first_step=True,  # Log the first step
+        log_level="info",  # Info level logging
         learning_rate=cfg.learning_rate,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -250,25 +350,84 @@ def main() -> None:
         temperature=1.0,
         beta=cfg.beta,  # KL coeff
         model_init_kwargs=model_kwargs,
-        report_to="none",
+        report_to="none",  # No external logging (wandb/tensorboard)
         bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
+        # Evaluation and saving
+        eval_strategy="steps" if eval_dataset else "no",
+        eval_steps=50 if eval_dataset else None,  # Evaluate every 50 steps if eval dataset provided
+        save_strategy="steps",
+        save_steps=5,  # Save checkpoint every 5 steps
+        save_total_limit=3,  # Keep only the last 3 checkpoints
+        load_best_model_at_end=False,  # Don't load best model (we'll handle this manually if needed)
+        # Logging details
+        logging_dir=cfg.output_dir,  # Directory for logs
+        run_name="rlvr_grpo_training",  # Name for this training run
     )
 
-    # 4. Initialize GRPOTrainer
+    # 5. Initialize GRPOTrainer
     # Note: In TRL v0.28.0:
     # - tokenizer is not passed directly (loaded automatically from model)
     # - prompt_column and completion_column are not parameters
     # - Dataset should have "prompt" and "completion" columns (standard names)
+    # - Pass the model object directly (not model path) when using LoRA
+    # - Reward functions are called with prompts and completions as keyword arguments
     trainer = GRPOTrainer(
-        model=cfg.init_from,
+        model=model,  # Use the LoRA-enabled model
         reward_funcs=[accuracy_reward_func],
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
     )
 
-    # 5. Start training
-    trainer.train()
+    # 6. Start training with logging
+    print("\n" + "="*80)
+    print("Starting RLVR GRPO Training")
+    print("="*80)
+    print(f"Training dataset size: {len(train_dataset)}")
+    print(f"Evaluation dataset size: {len(eval_dataset) if eval_dataset else 0}")
+    print(f"Batch size: {cfg.batch_size} (per_device: {per_device_train_batch_size}, grad_accum: {gradient_accumulation_steps})")
+    print(f"Number of generations per prompt: {cfg.num_generations}")
+    print(f"Learning rate: {cfg.learning_rate}")
+    print(f"Number of epochs: {cfg.num_train_epochs}")
+    print(f"Temperature: 1.0")
+    print(f"Beta (KL coeff): {cfg.beta}")
+    print("="*80 + "\n")
+    
+    # Start training - logs will be displayed automatically
+    if args.resume_from_checkpoint:
+        print(f"Resuming training from checkpoint: {args.resume_from_checkpoint}")
+        train_result = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+    else:
+        train_result = trainer.train()
+    
+    print("\n" + "="*80)
+    print("Training Complete!")
+    print("="*80)
+    print(f"Training loss: {train_result.training_loss:.4f}" if hasattr(train_result, 'training_loss') else "")
+    if hasattr(train_result, 'metrics'):
+        print(f"Training metrics: {train_result.metrics}")
+    print("="*80 + "\n")
+
+    # 7. Save final model (useful path for evaluation pipeline)
+    if not args.no_lora:
+        # For LoRA, save the adapter weights
+        trainer.save_model(cfg.output_dir)
+        tokenizer.save_pretrained(cfg.output_dir)
+        
+        # Also merge and save the full model (for easier evaluation)
+        # This creates a model that can be loaded without PEFT
+        merged_model = model.merge_and_unload()
+        merged_output_dir = cfg.output_dir + "_merged"
+        merged_model.save_pretrained(merged_output_dir)
+        tokenizer.save_pretrained(merged_output_dir)
+        print(f"Saved LoRA adapter to: {cfg.output_dir}")
+        print(f"Saved merged model (for evaluation) to: {merged_output_dir}")
+        print(f"Note: Use '{merged_output_dir}' in models_config.json for evaluation")
+    else:
+        # For full fine-tuning, save normally
+        trainer.save_model(cfg.output_dir)
+        tokenizer.save_pretrained(cfg.output_dir)
+        print(f"Saved model to: {cfg.output_dir}")
 
 
 if __name__ == "__main__":

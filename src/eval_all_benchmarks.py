@@ -38,6 +38,7 @@ def run_lm_eval(
     output_path: str | None = None,
     device: str = "cuda",
     limit: int | None = None,
+    cache_dir: str | None = None,
 ) -> str:
     """
     Run lm_eval. Returns output directory path.
@@ -91,6 +92,12 @@ def run_lm_eval(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
+    # Enable lm_eval caching so interrupted runs can resume without
+    # re-evaluating already-completed samples.
+    # Per lm-evaluation-harness docs, this uses: --use_cache <DIR>
+    if cache_dir is not None:
+        cmd.extend(["--use_cache", cache_dir])
+
     cmd.extend(["--gen_kwargs", gen_kwargs])
     if limit is not None:
         cmd.extend(["--limit", str(limit)])
@@ -112,6 +119,7 @@ def evaluate_single_config(
     max_gen_toks: int = 4096,
     limit: Optional[int] = None,
     results_dir: str = "results",
+    cache_dir: Optional[str] = None,
 ) -> dict:
     """
     Evaluate a single model/benchmark/mode combination.
@@ -162,6 +170,7 @@ def evaluate_single_config(
             output_path=output_dir,
             device=device,
             limit=limit,
+            cache_dir=cache_dir,
         )
         
         elapsed_time = time.time() - start_time
@@ -305,6 +314,18 @@ Examples:
         action="store_true",
         help="Skip evaluations if output directory already exists"
     )
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        default=None,
+        help="Directory to use for lm_eval --use_cache <DIR> (enables caching when set)"
+    )
+    parser.add_argument(
+        "--checkpoint-file",
+        type=str,
+        default=None,
+        help="Path to a JSON checkpoint file to resume evaluations"
+    )
     
     args = parser.parse_args()
     
@@ -350,10 +371,81 @@ Examples:
         if model_path and not Path(model_path).exists():
             print(f"WARNING: Model path '{model_path}' does not exist. Will try to load anyway.")
     
-    # Create results summary
-    all_results = []
-    summary_file = Path(args.results_dir) / f"evaluation_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    # Create / load results summary & checkpoint
+    all_results: list[dict] = []
+    completed_keys: set[str] = set()
+
+    # Always create a fresh evaluation_summary_....json for analysis
     Path(args.results_dir).mkdir(parents=True, exist_ok=True)
+    summary_file = (
+        Path(args.results_dir)
+        / f"evaluation_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    )
+
+    # Optional separate checkpoint file for resuming evaluations
+    checkpoint_path: Optional[Path] = None
+    print(f"Checkpoint file: {args.checkpoint_file}")
+    if args.checkpoint_file:
+        checkpoint_path = Path(args.checkpoint_file).expanduser()
+        # Try to resolve to absolute path
+        try:
+            checkpoint_path = checkpoint_path.resolve()
+        except Exception:
+            # If resolution fails (e.g., parent doesn't exist), use as-is
+            pass
+        
+        print(f"\n{'='*80}")
+        print(f"Checkpoint Configuration")
+        print(f"{'='*80}")
+        print(f"Checkpoint file path: {checkpoint_path}")
+        print(f"Absolute path: {checkpoint_path.absolute()}")
+        print(f"File exists: {checkpoint_path.exists()}")
+        
+        if not checkpoint_path.exists():
+            print(f"WARNING: Checkpoint file not found. Starting fresh evaluation.")
+            print(f"Expected location: {checkpoint_path.absolute()}")
+            print(f"{'='*80}\n")
+        else:
+            # Ensure parent directory exists (for writing updated checkpoint)
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        if checkpoint_path.exists():
+            try:
+                with open(checkpoint_path, "r") as f:
+                    saved = json.load(f)
+                all_results = saved.get("results", []) or []
+                
+                # Use completed_keys directly from checkpoint if available
+                saved_completed_keys = saved.get("completed_keys", [])
+                if saved_completed_keys:
+                    completed_keys = set(saved_completed_keys)
+                    print(
+                        f"Loaded checkpoint from {checkpoint_path}: "
+                        f"{len(completed_keys)} completed evaluations from completed_keys field."
+                    )
+                else:
+                    # Fallback: reconstruct completed keys from results
+                    for r in all_results:
+                        mk = r.get("model_key")
+                        bm = r.get("benchmark")
+                        md = r.get("mode")
+                        if mk is None or bm is None or md is None:
+                            continue
+                        if r.get("success"):
+                            completed_keys.add(f"{mk}::{bm}::{md}")
+                    print(
+                        f"Loaded checkpoint from {checkpoint_path}: "
+                        f"{len(completed_keys)} completed evaluations (reconstructed from results)."
+                    )
+                
+                # Debug: print what keys were loaded
+                if completed_keys:
+                    print(f"Completed keys: {sorted(completed_keys)}")
+                print(f"{'='*80}\n")
+            except Exception as e:
+                print(f"WARNING: Failed to load checkpoint '{checkpoint_path}': {e}")
+                import traceback
+                traceback.print_exc()
     
     total_evaluations = len(args.models) * len(args.benchmarks) * len(args.modes)
     current_eval = 0
@@ -385,14 +477,25 @@ Examples:
             for mode in args.modes:
                 current_eval += 1
                 print(f"\n[{current_eval}/{total_evaluations}] ", end="")
+
+                eval_key = f"{model_key}::{benchmark}::{mode}"
+
+                # Check checkpoint first (only skip if we previously saw a successful run)
+                if eval_key in completed_keys:
+                    print(f"Skipping (checkpoint): {model_key} | {benchmark} | {mode}")
+                    continue
                 
                 # Check if should skip
                 if args.skip_existing:
                     model_safe = model_name.replace("/", "_").replace("\\", "_")
-                    # Check for existing results (simplified check)
                     pattern = f"{benchmark}_{model_safe}_{mode}_*"
-                    existing = list(Path(args.results_dir).glob(pattern))
-                    if existing:
+                    existing_done = False
+                    for path in Path(args.results_dir).glob(pattern):
+                        results_file = path / "results.json"
+                        if results_file.exists():
+                            existing_done = True
+                            break
+                    if existing_done:
                         print(f"Skipping (exists): {model_key} | {benchmark} | {mode}")
                         continue
                 
@@ -406,19 +509,31 @@ Examples:
                     max_gen_toks=args.max_gen_toks,
                     limit=args.limit,
                     results_dir=args.results_dir,
+                    cache_dir=args.cache_dir,
                 )
-                
+
                 result["model_key"] = model_key
                 all_results.append(result)
-                
-                # Save intermediate results
+                if result.get("success"):
+                    completed_keys.add(eval_key)
+
+                # Save intermediate results / checkpoint
+                payload = {
+                    "config": vars(args),
+                    "model_config": model_config,
+                    "results": all_results,
+                    "completed_keys": sorted(list(completed_keys)),
+                    "total_time": time.time() - start_time,
+                }
+
+                # Analysis summary (timestamped file in results_dir)
                 with open(summary_file, "w") as f:
-                    json.dump({
-                        "config": vars(args),
-                        "model_config": model_config,
-                        "results": all_results,
-                        "total_time": time.time() - start_time,
-                    }, f, indent=2)
+                    json.dump(payload, f, indent=2)
+
+                # Optional separate checkpoint file for resuming
+                if checkpoint_path is not None:
+                    with open(checkpoint_path, "w") as f:
+                        json.dump(payload, f, indent=2)
     
     total_time = time.time() - start_time
     
@@ -446,3 +561,4 @@ Examples:
 
 if __name__ == "__main__":
     main()
+

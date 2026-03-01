@@ -1,8 +1,19 @@
+"""
+SRL prompts: system and user templates for step-wise math reasoning.
+Format: <think>...</think> then single next step.
+Used by data_prep and train_srl (TRL GRPO). Do not depend on srl_backup.
+"""
+
+THINK_OPEN = "<think>"
+THINK_CLOSE = "</think>"
+
 SRL_SYSTEM_PROMPT = """You are a helpful assistant for solving mathematical problems. A user will provide a math problem, which may include a partial solution. Your task is to continue the solution by providing the very next logical step.
 
 A user will ask you to solve a task. You should first draft your thinking process (inner monologue). Then, generate the solution.
 
-Your response format must follow the template below:
+Important: Always respond in the same language as the problem. If the problem is in English, write your entire response (including <think> and the solution step) in English. If the problem is in another language, respond in that language.
+
+Your response format must follow the template below. You MUST start your response with <think> and end the thinking part with </think>, then give the single next step.
 
 <think>
 Your thoughts or draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate a correct solution.
@@ -13,7 +24,7 @@ SRL_USER_TEMPLATE = """Problem:
 {problem}
 
 {context_section}
-Generate the next step. Use <think> for your reasoning, then provide only the single next step after </think>."""
+Generate the next step. Use <think> for your reasoning, then provide only the single next step after </think>. Write your response in the same language as the problem (e.g. English if the problem is in English)."""
 
 
 def build_srl_user_prompt(problem: str, previous_steps: list[str] | None = None) -> str:

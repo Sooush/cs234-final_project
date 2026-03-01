@@ -1,7 +1,7 @@
 """
 SRL reward computation: sequence similarity between model action step and expert step.
+Based on paper 2510.25992 (Supervised Reinforcement Learning).
 Baseline: difflib.SequenceMatcher ratio. Invalid outputs get reward=-1.
-Stub interfaces for embedding cosine and LLM-as-judge.
 """
 
 from __future__ import annotations
@@ -29,44 +29,30 @@ def parse_srl_output(text: str) -> tuple[str, str]:
 
     text = text.strip()
 
-    # Must contain think tags
     if THINK_OPEN not in text or THINK_CLOSE not in text:
         return ("", "")
 
-    # Extract think content
     think_start = text.find(THINK_OPEN)
     think_end = text.find(THINK_CLOSE, think_start)
     if think_end == -1:
         return ("", "")
 
     think_content = text[think_start + len(THINK_OPEN) : think_end].strip()
-
-    # Action step: everything after </think>, trimmed
     after_think = text[think_end + len(THINK_CLOSE) :].strip()
-
-    # Optional [ACTION STEP TEXT] marker - we take the line or block after </think>
     action_step = after_think
-    # If multiple lines, take first non-empty as single step; if looks like multiple numbered steps, invalid
     lines = [l.strip() for l in action_step.split("\n") if l.strip()]
 
-    # Invalid: multiple steps (e.g. "1. ... \n 2. ...")
     if len(lines) > 1:
-        # Check if second line looks like a new step (starts with digit.)
         if lines[1] and re.match(r"^\d+\.\s", lines[1]):
             return ("", "")
 
-    # Single step: use first line or whole block if single block
     if lines:
-        # Heuristic: if first line is short and rest is continuation, use full block
         if len(lines) == 1:
             action_step = lines[0]
         else:
-            # Could be one step with multiple lines (e.g. equation block)
             action_step = "\n".join(lines)
 
-    # Normalize whitespace
     action_step = " ".join(action_step.split()) if action_step else ""
-
     return (think_content, action_step)
 
 
@@ -78,7 +64,6 @@ def is_valid_srl_output(text: str) -> bool:
 
 # --- Reward: baseline SequenceMatcher ---
 
-
 class RewardFn(ABC):
     """Abstract reward function interface for pluggable variants."""
 
@@ -89,19 +74,18 @@ class RewardFn(ABC):
 
 
 class SequenceMatcherReward(RewardFn):
-    """Baseline: difflib.SequenceMatcher ratio"""
+    """Baseline: difflib.SequenceMatcher ratio (paper-style step similarity)."""
 
     def __call__(self, model_step: str, expert_step: str) -> float:
         if not expert_step:
-            return 0.0  # malformed instance — no expert step to compare against
+            return 0.0
         if not model_step:
             return 0.0
         matcher = SequenceMatcher(None, expert_step, model_step)
         return matcher.ratio()
 
-# Default reward
-DEFAULT_REWARD_FN = SequenceMatcherReward()
 
+DEFAULT_REWARD_FN = SequenceMatcherReward()
 INVALID_REWARD = -1.0
 
 
@@ -111,17 +95,14 @@ def compute_srl_reward(
     reward_fn: Optional[RewardFn] = None,
 ) -> float:
     """
-    SRL-specific: Parse model output, extract action step, compute reward.
-    Invalid format -> -1.
+    SRL step-wise reward: parse model output, extract action step, compare to expert step.
+    Invalid format -> INVALID_REWARD (-1.0). Valid -> reward in [0, 1].
     """
     if reward_fn is None:
         reward_fn = DEFAULT_REWARD_FN
-
     if not expert_step:
         return INVALID_REWARD
-
     think, action_step = parse_srl_output(model_output)
     if not action_step:
         return INVALID_REWARD
-
     return reward_fn(action_step, expert_step)

@@ -16,7 +16,7 @@ SFT_OUTPUT="checkpoints/sft"
 SRL_OUTPUT="checkpoints/srl"
 SRL_INIT_FROM="checkpoints/sft"
 RLVR_OUTPUT="checkpoints/srl_rlvr"
-RLVR_INIT_FROM="checkpoints/srl/step_500"
+RLVR_INIT_FROM="checkpoints/srl"
 
 DEVICE_ARG=""
 
@@ -65,23 +65,18 @@ else
   echo "[Stage 1/3] SFT training skipped (--skip-sft)"
 fi
 
-# 2) SRL (init-from SFT by default)
+# 2) SRL (TRL GRPOTrainer; init from SFT optional)
 if [[ $SKIP_SRL -eq 0 ]]; then
-  echo "[Stage 2/3] SRL training (initialized from $SRL_INIT_FROM)..."
-  python -m src.train_srl \
-    --init-from "$SRL_INIT_FROM" \
-    --output-dir "$SRL_OUTPUT" \
-    --data data/srl_instances.jsonl \
-    --num-steps 500 \
-    --batch-size 4 \
-    --group-size 8 \
-    --max-new-tokens 512 \
-    --temperature 1.0 \
-    --lr 5e-7 \
-    --clip-epsilon 0.2 \
-    --eps-std 0.01 \
-    --checkpoint-every 100 \
-    --config configs/srl_qwen7b.yaml
+  echo "[Stage 2/3] SRL training (TRL GRPOTrainer, init from $SRL_INIT_FROM)..."
+  SRL_ARGS=(
+    --init-from "$SRL_INIT_FROM"
+    --output-dir "$SRL_OUTPUT"
+    --resume-latest
+  )
+  if [[ -f data/srl_instances.jsonl ]]; then
+    SRL_ARGS+=(--data-path data/srl_instances.jsonl)
+  fi
+  python -m src.train_srl "${SRL_ARGS[@]}"
   echo ""
 else
   echo "[Stage 2/3] SRL training skipped (--skip-srl)"
