@@ -11,6 +11,10 @@ from abc import ABC, abstractmethod
 from difflib import SequenceMatcher
 from typing import Optional
 
+import torch
+import torch.nn.functional as F
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
 
 # --- SRL-specific: Parse model output into (think, action_step) ---
 
@@ -98,10 +102,49 @@ class SequenceMatcherReward(RewardFn):
             return 0.0
         matcher = SequenceMatcher(None, expert_step, model_step)
         return matcher.ratio()
+    
 
-# Default reward
-DEFAULT_REWARD_FN = SequenceMatcherReward()
+'''
+Semantic reward w/ lightweight cross encoder deberta-v3-small, which is trained for NLI.
+(Per our milestone feedback, pivoted from math-similarity).
+Calculated as P(Entailment) - P(Contradiction), where expert = premise, model = hypothesis.
+'''
+class NLIReward(RewardFn):
+    # Init: creates reward object, loads model + tokenizer
+    def __init__(self, model_name: str = "cross-encoder/nli-deberta-v3-small"):
+        self.device = "cpu"             # To change based on GPU; if torch.?.is_available()
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_name).to(self.device)
+        
+        # Entailment / Contradiction labels -> IDs
+        labels = {k.lower(): v for k, v in self.model.config.label2id.items()}
+        self.entailment_idx = labels.get('entailment', 1)
+        self.contradiction_idx = labels.get('contradiction', 0)
 
+    # Input: generated step, expert step
+    # Output: reward in [-1, 1] (higher = better aligned w/ expert)
+    def __call__(self, model_step: str, expert_step: str) -> float:
+        if not expert_step or not model_step:
+            return -1.0
+
+        # Tokenize as [CLS] expert_step [SEP] model_step [SEP]
+        inputs = self.tokenizer(
+            expert_step, 
+            model_step, 
+            return_tensors="pt", 
+            truncation=True, 
+            max_length=256
+        ).to(self.device)
+
+        with torch.no_grad():
+            logits = self.model(**inputs).logits
+        probs = torch.softmax(logits, dim=1).squeeze()
+
+        p_entailment = probs[self.entailment_idx].item()
+        p_contradiction = probs[self.contradiction_idx].item()
+        return p_entailment - p_contradiction
+
+DEFAULT_REWARD_FN = NLIReward()
 INVALID_REWARD = -1.0
 
 
