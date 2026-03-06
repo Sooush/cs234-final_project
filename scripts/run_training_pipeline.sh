@@ -90,16 +90,16 @@ fi
 # 3) RLVR (init-from SRL checkpoint)
 if [[ $SKIP_RLVR -eq 0 ]]; then
   LATEST_CKPT=""
-  if [ -d "$OUTPUT_DIR" ]; then
+  if [ -d "$RLVR_OUTPUT" ]; then
     # Look for subdirectories like checkpoint-*, sorted by version
-    LATEST_CKPT=$(ls -d "$OUTPUT_DIR"/checkpoint-* 2>/dev/null | sort -V | tail -n 1 || true)
+    LATEST_CKPT=$(ls -d "$RLVR_OUTPUT"/checkpoint-* 2>/dev/null | sort -V | tail -n 1 || true)
   fi
 
   if [ -n "$LATEST_CKPT" ] && [ -d "$LATEST_CKPT" ]; then
     echo "Found existing checkpoint: $LATEST_CKPT"
     echo "Resuming RLVR training from last checkpoint..."
   else
-    echo "No existing checkpoints found under $OUTPUT_DIR."
+    echo "No existing checkpoints found under $RLVR_OUTPUT."
     echo "Starting RLVR training from scratch (no --resume-from-checkpoint)."
   fi
 
