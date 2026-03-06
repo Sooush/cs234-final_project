@@ -1,6 +1,7 @@
 """
-RLVR (outcome-based GRPO) training script.
+RLVR (outcome-based GRPO) training script with LoRA.
 
+Uses LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning.
 
 - batch size ≈ 128 (prompts)
 - learning_rate = 5e-7
@@ -8,6 +9,8 @@ RLVR (outcome-based GRPO) training script.
 - rollout number (num_generations) = 8
 - KL loss coeff (beta) = 0.0
 - dtype = bf16 (if available)
+- LoRA rank = 16 (default)
+- LoRA alpha = 32 (default)
 
 This script can be run:
 1. After SRL training, using the SRL checkpoint as initialization:
@@ -20,18 +23,20 @@ This script can be run:
      --output-dir checkpoints/srl_rlvr
 
 After training, point `configs/models_config.json["models"]["srl_rlvr"]["model_path"]`
-to the RLVR checkpoint directory (e.g. `checkpoints/srl_rlvr`) so that the
-existing evaluation pipeline can pick it up.
+to the RLVR checkpoint directory (e.g. `checkpoints/srl_rlvr` or `checkpoints/srl_rlvr_merged`) 
+so that the existing evaluation pipeline can pick it up.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import dataclass
 from typing import Dict, Any
 
 from datasets import load_dataset
-from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, get_peft_model, TaskType
 from trl import GRPOTrainer, GRPOConfig
 import torch
 
@@ -39,6 +44,9 @@ from .model_config import get_base_model
 
 
 DEFAULT_DATASET = "simplescaling/s1K-1.1"
+
+FORMAT_REWARD_VALUE = 0.2
+ACCURACY_REWARD_VALUE = 0.8
 
 
 @dataclass
@@ -51,23 +59,34 @@ class RLVRConfig:
 
     # Paper hyperparameters (Table 6)
     learning_rate: float = 5e-7
-    batch_size: int = 128
-    num_generations: int = 8
-    num_train_epochs: int = 3  # paper uses steps; epochs is a practical proxy
+    batch_size: int = 4
+    num_generations: int = 4
+    max_completion_length: int = 4096  # max tokens to generate per completion
+    num_train_epochs: int = 2  # paper uses steps; epochs is a practical proxy
     beta: float = 0.0  # KL coeff
 
 
 def build_prompt(example: Dict[str, Any]) -> str:
     """
-    Build a simple instruction-style prompt from a s1K-style example.
-    Assumes fields: "problem" and "solution" (as in s1K-1.1).
-    RLVR reward will check final answer correctness.
+    Build the RLVR prompt from a s1K-style example (fields: "problem", "solution").
+    Follows the format from paper 2510.25992 (Supervised Reinforcement Learning):
+    the model should first produce an internal reasoning monologue in <think>...</think>,
+    then provide the step-by-step solution and final answer after </think>.
+    Instructions stress token efficiency, a single answer, and no repetition or off-topic content.
     """
     problem = example.get("problem") or example.get("question") or ""
+    open_think, close_think = "<think>", "</think>"
     return (
-        "You are a helpful math assistant. Solve the following problem step by step, "
-        "then give the final answer clearly.\n\n"
-        f"Problem:\n{problem}\n\nAnswer:"
+        "You are a helpful math assistant. Solve ONLY the following problem. Be token-efficient: "
+        "no repetition, no extra questions, no filler.\n\n"
+        "Rules:\n"
+        "1. Use exactly one <think>...</think> block with concise reasoning, then brief solution steps.\n"
+        "2. End with exactly one line: \"The answer is [number]\" (replace [number] with your final answer).\n"
+        "3. Stop immediately after that line. Do not repeat the answer, do not answer other questions, "
+        "and do not add more text to fill space.\n\n"
+        "Format: <think> key steps only </think> solution steps, then \"The answer is [number]\".\n\n"
+        f"Problem:\n{problem}\n\n"
+        "Answer:"
     )
 
 
@@ -79,41 +98,123 @@ def extract_final_answer(text: str) -> str:
     # Very simple heuristic: take the last number in the string.
     import re
 
-    numbers = re.findall(r"-?\\d+\\.?\\d*", text)
+    numbers = re.findall(r"-?\d+\.?\d*", text)
     return numbers[-1] if numbers else ""
 
 
-def accuracy_reward_func(samples: list[Dict[str, Any]]) -> list[float]:
-    """
-    Simple RLVR reward: 1.0 if final answer matches ground truth, else 0.0.
+def _answers_match(gt: str, pred: str) -> bool:
+    """Compare extracted answers; treat numeric equality so 5 == 5.0."""
+    if not gt or not pred:
+        return False
+    if gt == pred:
+        return True
+    try:
+        return float(gt) == float(pred)
+    except ValueError:
+        return False
 
-    The GRPOTrainer in TRL v0.28.0 will call this with a list of dicts containing:
-      - "prompt": str
-      - "completion": str (model-generated completion)
-      - The dataset's "completion" column contains the ground truth solution
-    """
-    rewards: list[float] = []
-    for s in samples:
-        # Model-generated completion
-        model_completion: str = s.get("completion", "")
-        
-        # Ground truth is stored in the dataset's "completion" column
-        # In TRL v0.28.0, the original dataset row might be in metadata
-        # or we need to compare against the dataset's completion column
-        # For now, we'll extract from the sample's original data
-        # Note: This may need adjustment based on how TRL v0.28.0 passes data
-        ground_truth: str = ""
-        if "metadata" in s and isinstance(s["metadata"], dict):
-            ground_truth = s["metadata"].get("completion", "")
-        elif "original_completion" in s:
-            ground_truth = s["original_completion"]
-        
-        # Extract final answers
-        gt = extract_final_answer(ground_truth)
-        pred = extract_final_answer(model_completion)
 
-        rewards.append(1.0 if gt and pred == gt else 0.0)
-    return rewards
+def _has_think_format(text: str) -> bool:
+    """
+    True if the completion has <think>...</think> format (opening and closing think tags
+    with closing tag after the opening, and some content in or after the block).
+    """
+    if not text or not isinstance(text, str):
+        return False
+    t = text.strip()
+    open_tag, close_tag = "<think>", "</think>"
+    if open_tag not in t or close_tag not in t:
+        return False
+    start = t.find(open_tag)
+    end = t.find(close_tag, start)
+    if end == -1:
+        return False
+    think_content = t[start + len(open_tag) : end].strip()
+    after_think = t[end + len(close_tag) :].strip()
+    return bool(think_content or after_think)
+
+
+def create_accuracy_reward_func(dataset, prompt_builder=None):
+    """
+    Create an accuracy reward function that has access to the dataset for ground truth.
+    """
+    if prompt_builder is None:
+        prompt_builder = build_prompt
+
+    prompt_to_gt = {}
+    for example in dataset:
+        prompt = prompt_builder(example)
+        key = prompt.strip() if prompt else ""
+        gt_completion = example.get("solution", "")
+        prompt_to_gt[key] = gt_completion
+    
+    def accuracy_reward_func(prompts=None, completions=None, **kwargs):
+        """
+        Simple RLVR reward: 0.8 if final answer matches ground truth, else 0.0.
+        Note: If all rewards are 0, GRPO advantages become 0 (zero reward std per group),
+        so training loss will be 0 and no learning happens. Ensure prompt lookup and
+        answer comparison are correct so some rewards can be non-zero.
+        """
+        if prompts is None:
+            prompts = []
+        if completions is None:
+            completions = []
+
+        rewards: list[float] = []
+
+        for i, (prompt, completion) in enumerate(zip(prompts, completions)):
+            # Look up with stripped key to match how we built the map
+            key = (prompt.strip() if prompt else "")
+            ground_truth = prompt_to_gt.get(key, "")
+
+            gt = extract_final_answer(ground_truth)
+            pred = extract_final_answer(completion)
+            rewards.append(ACCURACY_REWARD_VALUE if _answers_match(gt, pred) else 0.0)
+
+        # Optional: log first few reward samples to verify lookup and comparison (set RLVR_DEBUG_REWARD=1)
+        if os.environ.get("RLVR_DEBUG_REWARD", "").strip() == "1":
+            for i, (r, p, c) in enumerate(zip(rewards, prompts[:3], completions[:3])):
+                key = (p.strip() if p else "")
+                gt_raw = prompt_to_gt.get(key, "")
+                gt = extract_final_answer(gt_raw)
+                pred = extract_final_answer(c)
+                print(f"[RLVR reward] sample {i}: gt={gt!r} pred={pred!r} reward={r} (key_in_map={key[:50]!r}...)")
+            os.environ["RLVR_DEBUG_REWARD"] = "0"  # log only once
+
+        #try:
+        #    with open("/tmp/rlvr_reward.log", "a") as f:
+        #        f.write(f"Accuracy Reward: {rewards[-1]}\n")
+        #except OSError:
+        #    pass
+        return rewards
+    
+    return accuracy_reward_func
+
+
+
+
+
+def create_format_reward_func():
+    """
+    Create a format reward function for GRPO.
+    Returns FORMAT_REWARD_VALUE (0.2) per completion that has correct format.
+    Debug: rewards are appended to /tmp/rlvr_format_reward.log.
+    """
+
+    def format_reward_func(prompts=None, completions=None, **kwargs):
+        if completions is None:
+            completions = []
+        rewards: list[float] = []
+        for completion in completions:
+            rewards.append(FORMAT_REWARD_VALUE if _has_think_format(completion) else 0.0)
+            #try:
+            #    with open("/tmp/rlvr_reward.log", "a") as f:
+            #        f.write(f"Format Reward: {rewards[-1]}\n Completion: {completion}\n")
+            #except OSError:
+            #    pass
+        return rewards
+
+    return format_reward_func
 
 
 def main() -> None:
@@ -149,7 +250,46 @@ def main() -> None:
         default=256,
         help="Optional: limit number of eval samples",
     )
+    parser.add_argument(
+        "--lora-r",
+        type=int,
+        default=16,
+        help="LoRA rank (default: 16)",
+    )
+    parser.add_argument(
+        "--lora-alpha",
+        type=int,
+        default=32,
+        help="LoRA alpha scaling parameter (default: 32)",
+    )
+    parser.add_argument(
+        "--lora-dropout",
+        type=float,
+        default=0.05,
+        help="LoRA dropout rate (default: 0.05)",
+    )
+    parser.add_argument(
+        "--no-lora",
+        action="store_true",
+        help="Disable LoRA and use full fine-tuning",
+    )
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Path to a checkpoint directory to resume RLVR training from "
+            "(e.g. checkpoints/srl_rlvr/checkpoint-50). "
+            "If not set, training starts from scratch in output_dir."
+        ),
+    )
 
+    parser.add_argument(
+        "--max-completion-length",
+        type=int,
+        default=512,
+        help="Max tokens to generate per completion (default: 512)",
+    )
     args = parser.parse_args()
 
     cfg = RLVRConfig(
@@ -158,6 +298,7 @@ def main() -> None:
         dataset_name=args.dataset_name,
         max_train_samples=args.max_train_samples,
         max_eval_samples=args.max_eval_samples,
+        max_completion_length=args.max_completion_length,
     )
 
     base_model = get_base_model()
@@ -179,10 +320,9 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
 
     # 1. Load dataset
-    # Note: s1K-1.1 only has "train" split, so we split it manually
-    dataset = load_dataset(cfg.dataset_name, split="train")
+    dataset = load_dataset(cfg.dataset_name, split="train").shuffle(seed=42)
     
-    # Split train/val from the dataset (same approach as train_sft.py)
+    # Split train/val from the shuffled dataset
     EVAL_SIZE = 60
     TRAIN_SIZE = len(dataset) - EVAL_SIZE
     
@@ -194,81 +334,215 @@ def main() -> None:
     if cfg.max_eval_samples is not None:
         raw_eval = raw_eval.select(range(min(cfg.max_eval_samples, len(raw_eval))))
 
+    # Build prompts using the tokenizer's chat template, with a separate system and user message.
+    def build_chat_prompt(example: Dict[str, Any]) -> str:
+        problem_text = example.get("problem") or example.get("question") or ""
+        open_think, close_think = "<think>", "</think>"
+
+        system_content = (
+            "You are a helpful assistant for solving mathematical problems.\n"
+            "A user will provide a math problem and ask you to solve the task.\n"
+            "You should first draft your thinking process (inner monologue). Then, generate the solution."
+            "Your response format must follow the template below: <think> Your thoughts or/and draft, like working through an exercise on"
+            "scratch paper. Be as casual and as long as you want until you are confident to generate a correct solution. </think>\n"
+            "Provide only the single answer and solve the problem.\n"
+
+            "You are a helpful assistant specialized in solving mathematical problems.\n"
+            "A user will provide a math problem for you to solve.\n"
+            "You must first outline your reasoning process (inner monologue) in detail, then provide the final solution.\n"
+            "Response Format Requirement:\n"
+            "Your response must strictly follow this template:\n"
+            "<think> [Your step-by-step reasoning, calculations, and scratchpad notes. Be as thorough and informal as needed until you are confident in the result.] </think>\n"
+            "After the think block, provide only the final answer without further explanation."
+        )
+        user_content = f"Here is the problem:\n{problem_text}\n\nPlease provide the answer:"
+
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
+        ]
+
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
     def map_to_prompts(example: Dict[str, Any]) -> Dict[str, Any]:
-        # GRPOTrainer expects specific column names in TRL v0.28.0
-        # Use standard column names: "prompt" and "completion"
         return {
-            "prompt": build_prompt(example),
-            "completion": example.get("solution", ""),  # Use "completion" instead of "solution"
+            "prompt": build_chat_prompt(example),
+            "completion": example.get("solution", ""),
         }
 
     train_dataset = raw_train.map(map_to_prompts)
     eval_dataset = raw_eval.map(map_to_prompts)
 
-    # 2. Model loading config
-    # Note: Quantization cannot be used for fine-tuning base models
-    # Quantized models require PEFT adapters for training
-    # We only use quantization if explicitly needed for checkpoint loading (disabled by default)
+    # Create reward function with access to the dataset for ground truth matching.
+    # Use the same chat-formatted prompt builder so lookup keys match GRPOTrainer prompts.
+    accuracy_reward_func = create_accuracy_reward_func(raw_train, prompt_builder=build_chat_prompt)
+    format_reward_func = create_format_reward_func()
+
+    # 2. Load model and apply LoRA (if enabled)
+    # Try to load from init_from, fallback to base model if it fails
+    print(f"Attempting to load model from: {init_from}")
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            init_from,
+            dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16,
+            trust_remote_code=True,
+            device_map="auto" if torch.cuda.is_available() else None,
+        )
+        print(f"Successfully loaded model from: {init_from}")
+    except Exception as e:
+        print(f"Failed to load model from '{init_from}': {e}")
+        print(f"Falling back to base model: {base_model}")
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16,
+            trust_remote_code=True,
+            device_map="auto" if torch.cuda.is_available() else None,
+        )
+        print(f"Successfully loaded base model: {base_model}")
+    
+    if not args.no_lora:
+        # Configure LoRA for Qwen models
+        # Target attention and MLP layers
+        print("Applying LoRA")
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+        # For Qwen models, also target MLP layers if they exist
+        try:
+            # Check if model has gate_proj, up_proj, down_proj (typical for Qwen)
+            first_layer = next(iter(model.model.layers)) if hasattr(model, 'model') else None
+            if first_layer and hasattr(first_layer, 'mlp'):
+                if hasattr(first_layer.mlp, 'gate_proj'):
+                    target_modules.extend(["gate_proj", "up_proj", "down_proj"])
+        except Exception as e:
+            print(f"Error in target modules: {e}")
+            pass
+        
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+        )
+        
+        print(f"Applying LoRA with rank={args.lora_r}, alpha={args.lora_alpha}, dropout={args.lora_dropout}")
+        print(f"Target modules: {target_modules}")
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+    else:
+        print("Using full fine-tuning (LoRA disabled)")
+
+    # Enable gradient checkpointing to reduce memory usage
+    print("Disabling use_cache and enabling gradient checkpointing")
+    model.use_cache = False
+    model.gradient_checkpointing_enable()
+
+    # 3. Model loading config for GRPOConfig (if needed)
     model_kwargs = {
         "dtype": torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16,
         "low_cpu_mem_usage": True,
     }
-    
-    # Quantization is disabled to allow full fine-tuning
-    # If memory is constrained, consider using gradient checkpointing or smaller batch sizes instead
-    # quantization_config = BitsAndBytesConfig(
-    #     load_in_4bit=True,
-    #     bnb_4bit_compute_dtype=torch.float16,
-    #     bnb_4bit_quant_type="nf4",
-    # )
-    # model_kwargs["quantization_config"] = quantization_config
 
-    # 3. GRPO training configuration (match Table 6)
-    # Paper hyperparameters (Table 6):
-    # - batch size ≈ 128 (prompts)
-    # - learning_rate = 5e-7
-    # - rollout temperature = 1.0
-    # - rollout number (num_generations) = 8
-    # - KL loss coeff (beta) = 0.0
-    # - dtype = bf16 (if available)
-    
+    # 4. GRPO training configuration
     per_device_train_batch_size = 1
     gradient_accumulation_steps = cfg.batch_size // per_device_train_batch_size
+    print(f"Per device train batch size: {per_device_train_batch_size}")
+    print(f"Batch size: {cfg.batch_size}")
+    print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
 
-    # GRPOConfig in TRL v0.28.0 extends TrainingArguments
-    # Note: model is passed to GRPOTrainer, not to GRPOConfig
+    # GRPOConfig's TrainingArguments
     training_args = GRPOConfig(
         output_dir=cfg.output_dir,
-        logging_steps=10,
-        log_level="info",
+        logging_steps=10,  # Log every 10 steps
+        logging_first_step=True,  # Log the first step
+        log_level="info",  # Info level logging
         learning_rate=cfg.learning_rate,
         per_device_train_batch_size=per_device_train_batch_size,
+        per_device_eval_batch_size=gradient_accumulation_steps,
         gradient_accumulation_steps=gradient_accumulation_steps,
         num_train_epochs=cfg.num_train_epochs,
         num_generations=cfg.num_generations,
-        max_completion_length=512,
+        max_completion_length=cfg.max_completion_length,
         temperature=1.0,
         beta=cfg.beta,  # KL coeff
         model_init_kwargs=model_kwargs,
-        report_to="none",
+        report_to="none",  # No external logging (wandb/tensorboard)
         bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
+        # Evaluation and saving
+        eval_strategy="steps" if eval_dataset else "no",
+        eval_steps=50 if eval_dataset else None,  # Evaluate every 50 steps if eval dataset provided
+        save_strategy="steps",
+        save_steps=5,  # Save checkpoint every 5 steps
+        save_total_limit=3,  # Keep only the last 3 checkpoints
+        load_best_model_at_end=False,  # Don't load best model (we'll handle this manually if needed)
+        # Logging details
+        logging_dir=cfg.output_dir,  # Directory for logs
+        run_name="rlvr_grpo_training",  # Name for this training run
     )
 
-    # 4. Initialize GRPOTrainer
-    # Note: In TRL v0.28.0:
-    # - tokenizer is not passed directly (loaded automatically from model)
-    # - prompt_column and completion_column are not parameters
-    # - Dataset should have "prompt" and "completion" columns (standard names)
+    # 5. Initialize GRPOTrainer
     trainer = GRPOTrainer(
-        model=cfg.init_from,
-        reward_funcs=[accuracy_reward_func],
+        model=model,  # Use the LoRA-enabled model
+        reward_funcs=[accuracy_reward_func, format_reward_func],
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
     )
 
-    # 5. Start training
-    trainer.train()
+    # 6. Start training with logging
+    print("\n" + "="*80)
+    print("Starting RLVR GRPO Training")
+    print("="*80)
+    print(f"Training dataset size: {len(train_dataset)}")
+    print(f"Evaluation dataset size: {len(eval_dataset) if eval_dataset else 0}")
+    print(f"Batch size: {cfg.batch_size} (per_device: {per_device_train_batch_size}, grad_accum: {gradient_accumulation_steps})")
+    print(f"Number of generations per prompt: {cfg.num_generations}")
+    print(f"Max completion length (tokens): {cfg.max_completion_length}")
+    print(f"Learning rate: {cfg.learning_rate}")
+    print(f"Number of epochs: {cfg.num_train_epochs}")
+    print(f"Temperature: 1.0")
+    print(f"Beta (KL coeff): {cfg.beta}")
+    print("="*80 + "\n")
+    
+    # Start training - logs will be displayed automatically
+    if args.resume_from_checkpoint:
+        print(f"Resuming training from checkpoint: {args.resume_from_checkpoint}")
+        train_result = trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+    else:
+        train_result = trainer.train()
+    
+    print("\n" + "="*80)
+    print("Training Complete!")
+    print("="*80)
+    print(f"Training loss: {train_result.training_loss:.4f}" if hasattr(train_result, 'training_loss') else "")
+    if hasattr(train_result, 'metrics'):
+        print(f"Training metrics: {train_result.metrics}")
+    print("="*80 + "\n")
+
+    # 7. Save final model (useful path for evaluation pipeline)
+    if not args.no_lora:
+        # For LoRA, save the adapter weights
+        trainer.save_model(cfg.output_dir)
+        tokenizer.save_pretrained(cfg.output_dir)
+        
+        # Also merge and save the full model (for easier evaluation)
+        # This creates a model that can be loaded without PEFT
+        merged_model = model.merge_and_unload()
+        merged_output_dir = cfg.output_dir + "_merged"
+        merged_model.save_pretrained(merged_output_dir)
+        tokenizer.save_pretrained(merged_output_dir)
+        print(f"Saved LoRA adapter to: {cfg.output_dir}")
+        print(f"Saved merged model (for evaluation) to: {merged_output_dir}")
+        print(f"Note: Use '{merged_output_dir}' in models_config.json for evaluation")
+    else:
+        # For full fine-tuning, save normally
+        trainer.save_model(cfg.output_dir)
+        tokenizer.save_pretrained(cfg.output_dir)
+        print(f"Saved model to: {cfg.output_dir}")
 
 
 if __name__ == "__main__":

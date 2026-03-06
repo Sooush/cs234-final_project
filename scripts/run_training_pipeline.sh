@@ -14,9 +14,9 @@ cd "$(dirname "$0")/.."
 
 SFT_OUTPUT="checkpoints/sft"
 SRL_OUTPUT="checkpoints/srl"
-SRL_INIT_FROM="checkpoints/sft"
+SRL_INIT_FROM="checkpoints/sft_merged"
 RLVR_OUTPUT="checkpoints/srl_rlvr"
-RLVR_INIT_FROM="checkpoints/srl/step_500"
+RLVR_INIT_FROM="checkpoints/srl_merged"
 
 DEVICE_ARG=""
 
@@ -89,10 +89,32 @@ fi
 
 # 3) RLVR (init-from SRL checkpoint)
 if [[ $SKIP_RLVR -eq 0 ]]; then
-  echo "[Stage 3/3] RLVR GRPO training (initialized from $RLVR_INIT_FROM)..."
-  python -m src.train_rlvr_grpo \
-    --init-from "$RLVR_INIT_FROM" \
+  LATEST_CKPT=""
+  if [ -d "$OUTPUT_DIR" ]; then
+    # Look for subdirectories like checkpoint-*, sorted by version
+    LATEST_CKPT=$(ls -d "$OUTPUT_DIR"/checkpoint-* 2>/dev/null | sort -V | tail -n 1 || true)
+  fi
+
+  if [ -n "$LATEST_CKPT" ] && [ -d "$LATEST_CKPT" ]; then
+    echo "Found existing checkpoint: $LATEST_CKPT"
+    echo "Resuming RLVR training from last checkpoint..."
+  else
+    echo "No existing checkpoints found under $OUTPUT_DIR."
+    echo "Starting RLVR training from scratch (no --resume-from-checkpoint)."
+  fi
+
+  RLVR_ARGS=(
+    --max-train-samples 250
+    --init-from "$RLVR_INIT_FROM"
     --output-dir "$RLVR_OUTPUT"
+  )
+  
+  if [ -n "$LATEST_CKPT" ] && [ -d "$LATEST_CKPT" ]; then
+    RLVR_ARGS+=(--resume-from-checkpoint "$LATEST_CKPT")
+  fi
+
+  echo "[Stage 3/3] RLVR GRPO training (initialized from $RLVR_INIT_FROM)..."
+  python -m src.train_rlvr_grpo "${RLVR_ARGS[@]}"
   echo ""
 else
   echo "[Stage 3/3] RLVR training skipped (--skip-rlvr)"

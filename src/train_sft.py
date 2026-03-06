@@ -1,5 +1,7 @@
 """
-Supervised Fine-Tuning (SFT) training script.
+Supervised Fine-Tuning (SFT) training script with LoRA.
+
+Uses LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning.
 
 - learning_rate = 5e-6
 - global batch size ≈ 64
@@ -7,6 +9,8 @@ Supervised Fine-Tuning (SFT) training script.
 - warmup_ratio = 0.3
 - num_train_epochs = 3
 - dtype = bf16 (if available)
+- LoRA rank = 16 (default)
+- LoRA alpha = 32 (default)
 
 This script is intended to be run as:
 
@@ -25,7 +29,8 @@ from typing import Dict, List
 
 import torch
 from datasets import load_dataset
-from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, get_peft_model, TaskType
 from trl import SFTTrainer, SFTConfig
 
 from .model_config import get_base_model
@@ -97,6 +102,29 @@ def main() -> None:
         default=512,
         help="Optional: limit number of eval samples",
     )
+    parser.add_argument(
+        "--lora-r",
+        type=int,
+        default=16,
+        help="LoRA rank (default: 16)",
+    )
+    parser.add_argument(
+        "--lora-alpha",
+        type=int,
+        default=32,
+        help="LoRA alpha scaling parameter (default: 32)",
+    )
+    parser.add_argument(
+        "--lora-dropout",
+        type=float,
+        default=0.05,
+        help="LoRA dropout rate (default: 0.05)",
+    )
+    parser.add_argument(
+        "--no-lora",
+        action="store_true",
+        help="Disable LoRA and use full fine-tuning",
+    )
 
     args = parser.parse_args()
 
@@ -132,7 +160,49 @@ def main() -> None:
     train_dataset = raw_train.map(formatting_func)
     eval_dataset = raw_eval.map(formatting_func)
 
-    # 3. Configure SFTConfig with paper hyperparameters (Table 5)
+    # 3. Load model and apply LoRA (if enabled)
+    print(f"Loading model: {args.model}")
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16,
+        trust_remote_code=True,
+        device_map="auto" if torch.cuda.is_available() else None,
+    )
+    print("model", model)
+
+    if not args.no_lora:
+        # Configure LoRA for Qwen models
+        # Target attention and MLP layers
+        print("Applying LoRA")
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+        # For Qwen models, also target MLP layers if they exist
+        try:
+            # Check if model has gate_proj, up_proj, down_proj (typical for Qwen)
+            first_layer = next(iter(model.model.layers)) if hasattr(model, 'model') else None
+            if first_layer and hasattr(first_layer, 'mlp'):
+                if hasattr(first_layer.mlp, 'gate_proj'):
+                    target_modules.extend(["gate_proj", "up_proj", "down_proj"])
+        except Exception as e:
+            print(f"Error in target modules: {e}")
+            pass
+        
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+        )
+        
+        print(f"Applying LoRA with rank={args.lora_r}, alpha={args.lora_alpha}, dropout={args.lora_dropout}")
+        print(f"Target modules: {target_modules}")
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+    else:
+        print("Using full fine-tuning (LoRA disabled)")
+
+    # 4. Configure SFTConfig with paper hyperparameters (Table 5)
     # Paper parameters:
     # - learning_rate = 5e-6
     # - global batch size ≈ 64
@@ -151,7 +221,7 @@ def main() -> None:
         learning_rate=5e-6,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
-        num_train_epochs=3,
+        num_train_epochs=2,
         lr_scheduler_type="cosine",
         warmup_ratio=0.3,
         
@@ -172,19 +242,38 @@ def main() -> None:
         # Try without it first, or check if it's a different parameter name
     )
 
-    # 4. Initialize SFT trainer with SFTConfig
+    # 5. Initialize SFT trainer with SFTConfig
+    # Note: Pass the model object directly (not model name) when using LoRA
     trainer = SFTTrainer(
-        model=args.model,
+        model=model,  # Use the LoRA-enabled model
         args=training_config,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
     )
 
-    # 5. Train
+    # 6. Train
     trainer.train()
 
-    # 6. Save final model (useful path for evaluation pipeline)
-    trainer.save_model(args.output_dir)
+    # 7. Save final model (useful path for evaluation pipeline)
+    if not args.no_lora:
+        # For LoRA, save the adapter weights
+        trainer.save_model(args.output_dir)
+        tokenizer.save_pretrained(args.output_dir)
+        
+        # Also merge and save the full model (for easier evaluation)
+        # This creates a model that can be loaded without PEFT
+        merged_model = model.merge_and_unload()
+        merged_output_dir = args.output_dir + "_merged"
+        merged_model.save_pretrained(merged_output_dir)
+        tokenizer.save_pretrained(merged_output_dir)
+        print(f"Saved LoRA adapter to: {args.output_dir}")
+        print(f"Saved merged model (for evaluation) to: {merged_output_dir}")
+        print(f"Note: Use '{merged_output_dir}' in models_config.json for evaluation")
+    else:
+        # For full fine-tuning, save normally
+        trainer.save_model(args.output_dir)
+        tokenizer.save_pretrained(args.output_dir)
+        print(f"Saved model to: {args.output_dir}")
 
 
 if __name__ == "__main__":
