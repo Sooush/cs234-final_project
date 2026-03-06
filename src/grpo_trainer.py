@@ -211,6 +211,23 @@ class GRPOTrainer:
                     continue
                 per_token_ratio = torch.exp(log_ratios.clamp(-5, 5))  # (T,)
                 per_token_clipped = torch.clamp(per_token_ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon)
+
+
+                ''' SECOND EXTENSION IMPLEMENTATION BELOW
+                For second extension, we should swap standard loss_term with the per-token
+                temporal credit assignment logic. 
+                Reward signal is only created/received after each generated step.
+
+                df = 0.99   # discount factor
+                seq_len = per_token_ratio.shape[0]
+
+                d = (df ** torch.arange(seq_len - 1, -1, -1))      # all temporal discounts
+
+                # Apply time decayed rewards for tokens & calc mean loss
+                token_advs = adv * discounts
+                loss_term = -(token_advs * torch.min(per_token_ratio, per_token_clipped)).mean()
+                '''
+
                 loss_term = -adv * torch.min(per_token_ratio, per_token_clipped).mean()
 
                 if torch.isfinite(loss_term):
