@@ -287,8 +287,8 @@ def main() -> None:
     parser.add_argument(
         "--max-completion-length",
         type=int,
-        default=512,
-        help="Max tokens to generate per completion (default: 512)",
+        default=4096,
+        help="Max tokens to generate per completion (default: 4096)",
     )
     args = parser.parse_args()
 
