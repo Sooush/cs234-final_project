@@ -104,6 +104,7 @@ if [[ $SKIP_RLVR -eq 0 ]]; then
   fi
 
   RLVR_ARGS=(
+    --max-completion-length 4096
     --max-train-samples 250
     --init-from "$RLVR_INIT_FROM"
     --output-dir "$RLVR_OUTPUT"
