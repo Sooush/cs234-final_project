@@ -1,0 +1,130 @@
+[
+  {
+    "model": "base",
+    "benchmark": "aime24",
+    "mode": "greedy",
+    "metric": 0.03333333333333333,
+    "elapsed_time": 1328.5329468250275,
+    "output_path": "results/aime24_Qwen_Qwen2.5-3B-Instruct_greedy_20260224_155957"
+  },
+  {
+    "model": "base",
+    "benchmark": "aime24",
+    "mode": "avg1",
+    "metric": 0.06666666666666667,
+    "elapsed_time": 1157.8866600990295,
+    "output_path": "results/aime24_Qwen_Qwen2.5-3B-Instruct_avg1_20260224_162206"
+  },
+  {
+    "model": "base",
+    "benchmark": "aime25",
+    "mode": "greedy",
+    "metric": 0.03333333333333333,
+    "elapsed_time": 1278.9731702804565,
+    "output_path": "results/aime25_Qwen_Qwen2.5-3B-Instruct_greedy_20260224_164124"
+  },
+  {
+    "model": "base",
+    "benchmark": "aime25",
+    "mode": "avg1",
+    "metric": 0.03333333333333333,
+    "elapsed_time": 1193.7658472061157,
+    "output_path": "results/aime25_Qwen_Qwen2.5-3B-Instruct_avg1_20260224_170243"
+  },
+  {
+    "model": "rlvr",
+    "benchmark": "aime24",
+    "mode": "avg1",
+    "metric": 0.06666666666666667,
+    "elapsed_time": 1456.466349363327,
+    "output_path": "results-0304-srl_rlvr-aime24_avg1/aime24_Qwen_Qwen2.5-3B-Instruct_avg1_20260304_145548"
+  },
+  {
+    "model": "rlvr",
+    "benchmark": "aime24",
+    "mode": "greedy",
+    "metric": 0.03333333333333333,
+    "elapsed_time": 1397.2454664707184,
+    "output_path": "results-0304-srl_rlvr-aime24_greedy/aime24_Qwen_Qwen2.5-3B-Instruct_greedy_20260304_143231"
+  },
+  {
+    "model": "rlvr",
+    "benchmark": "aime25",
+    "mode": "avg1",
+    "metric": 0.03333333333333333,
+    "elapsed_time": 1137.6995129585266,
+    "output_path": "results-0304-srl_rlvr-aime25_avg1/aime25_Qwen_Qwen2.5-3B-Instruct_avg1_20260304_154020"
+  },
+  {
+    "model": "rlvr",
+    "benchmark": "aime25",
+    "mode": "greedy",
+    "metric": 0.0,
+    "elapsed_time": 1215.0672297477722,
+    "output_path": "results-0304-srl_rlvr-aime25_greedy/aime25_Qwen_Qwen2.5-3B-Instruct_greedy_20260304_152005"
+  },
+  {
+    "model": "sft",
+    "benchmark": "aime24",
+    "mode": "avg1",
+    "metric": 0.0,
+    "elapsed_time": 1430.7766637802124,
+    "output_path": "results-0304-sft-aime24_avg1/aime24_Qwen_Qwen2.5-3B-Instruct_avg1_20260304_023932"
+  },
+  {
+    "model": "sft",
+    "benchmark": "aime24",
+    "mode": "greedy",
+    "metric": 0.06666666666666667,
+    "elapsed_time": 24.84626007080078,
+    "output_path": "results-0304-sft-aime24_greedy/aime24_Qwen_Qwen2.5-3B-Instruct_greedy_20260304_023907"
+  },
+  {
+    "model": "sft",
+    "benchmark": "aime25",
+    "mode": "avg1",
+    "metric": 0.03333333333333333,
+    "elapsed_time": 1184.9462623596191,
+    "output_path": "results-0304-sft-aime25_avg1/aime25_Qwen_Qwen2.5-3B-Instruct_avg1_20260304_030348"
+  },
+  {
+    "model": "sft",
+    "benchmark": "aime25",
+    "mode": "greedy",
+    "metric": 0.06666666666666667,
+    "elapsed_time": 24.568517446517944,
+    "output_path": "results-0304-sft-aime25_greedy/aime25_Qwen_Qwen2.5-3B-Instruct_greedy_20260304_030323"
+  },
+  {
+    "model": "srl",
+    "benchmark": "aime24",
+    "mode": "avg1",
+    "metric": 0.06666666666666667,
+    "elapsed_time": 1149.8575537204742,
+    "output_path": "results-0303-srl-aime24_avg1/aime24_Qwen_Qwen2.5-3B-Instruct_avg1_20260303_155610"
+  },
+  {
+    "model": "srl",
+    "benchmark": "aime24",
+    "mode": "greedy",
+    "metric": 0.06666666666666667,
+    "elapsed_time": 1534.3516974449158,
+    "output_path": "results-0303-srl-aime24_greedy/aime24_Qwen_Qwen2.5-3B-Instruct_greedy_20260303_153036"
+  },
+  {
+    "model": "srl",
+    "benchmark": "aime25",
+    "mode": "avg1",
+    "metric": 0.03333333333333333,
+    "elapsed_time": 1200.2838501930237,
+    "output_path": "results-0303-srl-aime25_avg1/aime25_Qwen_Qwen2.5-3B-Instruct_avg1_20260303_163407"
+  },
+  {
+    "model": "srl",
+    "benchmark": "aime25",
+    "mode": "greedy",
+    "metric": 0.06666666666666667,
+    "elapsed_time": 1127.127798318863,
+    "output_path": "results-0303-srl-aime25_greedy/aime25_Qwen_Qwen2.5-3B-Instruct_greedy_20260303_161520"
+  }
+]

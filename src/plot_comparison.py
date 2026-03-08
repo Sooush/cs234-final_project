@@ -39,6 +39,7 @@ def get_model_display_name(model_key: str) -> str:
     model_labels = {
         "base": "Qwen2.5-3B-Instruct",
         "sft": "SFT",
+        "rlvr": "RLVR",
         "srl": "SRL",
         "srl_rlvr": "SRL->RLVR"
     }
@@ -167,7 +168,7 @@ def create_bar_chart(df: pd.DataFrame, output_path: Path, mode: str = "greedy"):
     )
     
     # Sort models in a logical order
-    model_order = ["base", "sft", "srl", "srl_rlvr"]
+    model_order = ["base", "sft", "rlvr", "srl", "srl_rlvr"]
     pivot = pivot.reindex([m for m in model_order if m in pivot.index])
     
     # Create figure
@@ -224,7 +225,7 @@ def create_line_plot(df: pd.DataFrame, output_path: Path, mode: str = "greedy"):
     )
     
     # Sort models
-    model_order = ["base", "sft", "srl", "srl_rlvr"]
+    model_order = ["base", "sft", "rlvr", "srl", "srl_rlvr"]
     available_models = [m for m in model_order if m in pivot.columns]
     pivot = pivot[available_models]
     
@@ -270,7 +271,7 @@ def create_heatmap(df: pd.DataFrame, output_path: Path, mode: str = "greedy"):
     )
     
     # Sort models and benchmarks
-    model_order = ["base", "sft", "srl", "srl_rlvr"]
+    model_order = ["base", "sft", "rlvr", "srl", "srl_rlvr"]
     benchmark_order = ["amc23", "aime24", "aime25", "minerva_math"]
     
     pivot = pivot.reindex([m for m in model_order if m in pivot.index])
@@ -316,7 +317,7 @@ def create_comprehensive_bar_chart(df: pd.DataFrame, output_path: Path):
     )
     
     # Sort models
-    model_order = ["base", "sft", "srl", "srl_rlvr"]
+    model_order = ["base", "sft", "rlvr", "srl", "srl_rlvr"]
     pivot = pivot.reindex([m for m in model_order if m in pivot.index])
     
     # Sort columns by benchmark then mode
@@ -336,27 +337,19 @@ def create_comprehensive_bar_chart(df: pd.DataFrame, output_path: Path):
     
     pivot = pivot[sorted_cols]
     
-    # Adjust figure size based on number of models
     num_models = len(pivot.index)
-    if num_models == 1:
-        # For single model, use narrower figure to avoid stretching
-        fig, ax = plt.subplots(figsize=(12, 8))
-    else:
-        # For multiple models, use larger figure
-        fig, ax = plt.subplots(figsize=(20, 8))
-    
-    x = np.arange(len(pivot.index))
-    #width = 0.08  # Thin bars
-    width = 0.02
     num_groups = len(pivot.columns)
     
-    # Adjust width and spacing for single model to be proportional
+    # Auto-adjust figure width based on number of models (more models = wider figure)
+    fig_width = max(12, min(28, 3.5 * num_models))
+    fig, ax = plt.subplots(figsize=(fig_width, 8))
+    
+    x = np.arange(len(pivot.index))
+    # Auto-adjust bar width so all groups fit without overlap: total span per tick ~0.8
+    # width per group = 0.8 / num_groups, clamped so bars are visible but not huge
+    width = np.clip(0.8 / max(num_groups, 1), 0.02, 0.15)
+    
     if num_models == 1:
-        # Scale width based on number of groups to keep bars visible but proportional
-        # Use a base width that scales with number of groups
-        base_width = 0.8 / max(num_groups, 1)  # Total width of 0.8 divided by groups
-        width = min(base_width, 0.15)  # Cap at 0.15 to avoid too wide bars
-        # Center the bars around x=0
         x_center = 0
     else:
         x_center = None
@@ -366,12 +359,10 @@ def create_comprehensive_bar_chart(df: pd.DataFrame, output_path: Path):
     
     for i, (col, color) in enumerate(zip(pivot.columns, colors)):
         if num_models == 1:
-            # For single model, center bars around x=0, convert to percentage
             offset = (i - num_groups / 2 + 0.5) * width
             bars = ax.bar(x_center + offset, pivot[col].values * 100, width, 
                          label=col.replace('_', ' ').upper(), color=color, alpha=0.8)
         else:
-            # For multiple models, use original positioning, convert to percentage
             offset = (i - num_groups / 2 + 0.5) * width
             bars = ax.bar(x + offset, pivot[col].values * 100, width, 
                          label=col.replace('_', ' ').upper(), color=color, alpha=0.8)
@@ -379,12 +370,15 @@ def create_comprehensive_bar_chart(df: pd.DataFrame, output_path: Path):
         # Add value labels on bars (values already in percentage from * 100)
         for bar in bars:
             height = bar.get_height()
-            if not np.isnan(height) and height > 0.1:  # Greater than 0.1% after conversion
-                if height < 1.0:
+            if not np.isnan(height) and height >= 0:  # Include 0 so zero values are displayed
+                if height < 1.0 and height > 0:
                     label = f'{height:.2f}%'
+                elif height == 0:
+                    label = '0%'
                 else:
                     label = f'{height:.1f}%'
-                ax.text(bar.get_x() + bar.get_width()/2., height,
+                y_pos = max(height, 0.5)  # Place 0% label slightly above baseline so it's visible
+                ax.text(bar.get_x() + bar.get_width()/2., y_pos,
                        label,
                        ha='center', va='bottom', fontsize=6, rotation=90)
     
@@ -394,13 +388,10 @@ def create_comprehensive_bar_chart(df: pd.DataFrame, output_path: Path):
                  fontsize=16, fontweight='bold', pad=20)
     
     if num_models == 1:
-        # For single model, set x-axis to show just the model name centered
         ax.set_xticks([0])
         ax.set_xticklabels([get_model_display_name(m) for m in pivot.index], fontsize=12)
-        # Limit x-axis range to keep bars proportional
         ax.set_xlim(-0.5, 0.5)
     else:
-        # For multiple models, use original x-axis setup
         ax.set_xticks(x)
         ax.set_xticklabels([get_model_display_name(m) for m in pivot.index], fontsize=12)
     
@@ -468,7 +459,7 @@ def create_benchmark_mode_plot(df: pd.DataFrame, output_path: Path):
     pivot = pivot.reindex(sorted_index)
     
     # Sort models
-    model_order = ["base", "sft", "srl", "srl_rlvr"]
+    model_order = ["base", "sft", "rlvr", "srl", "srl_rlvr"]
     available_models = [m for m in model_order if m in pivot.columns]
     pivot = pivot[available_models]
     
@@ -506,13 +497,16 @@ def create_benchmark_mode_plot(df: pd.DataFrame, output_path: Path):
         for bar in bars:
             height = bar.get_height()
             if not np.isnan(height) and height >= 0:
-                if height < 1.0:  # Less than 1% after conversion
+                if height < 1.0 and height > 0:
                     label = f'{height:.2f}%'
+                elif height == 0:
+                    label = '0%'
                 else:
                     label = f'{height:.1f}%'
+                y_pos = max(height, 0.5)  # Place 0% label slightly above baseline so it's visible
                 ax.text(
                     bar.get_x() + bar.get_width()/2.,
-                    height,
+                    y_pos,
                     label,
                     ha='center',
                     va='bottom',
@@ -613,7 +607,7 @@ def create_multi_mode_comparison(df: pd.DataFrame, output_path: Path):
             aggfunc="first"
         )
         
-        model_order = ["base", "sft", "srl", "srl_rlvr"]
+        model_order = ["base", "sft", "rlvr", "srl", "srl_rlvr"]
         mode_order = ["greedy", "avg1", "avg32"]
         
         pivot = pivot.reindex([m for m in model_order if m in pivot.index])
