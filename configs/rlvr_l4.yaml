@@ -1,0 +1,51 @@
+# RLVR GRPO training config — optimized for NVIDIA L4 24 GB (g2-standard-8)
+# Memory budget: ~18-19 GB peak (longer completions ~840 tok vs SRL ~500 tok)
+# Note: per_device_eval_batch_size is hardcoded to 1 in train_rlvr_grpo.py to
+#       avoid OOM during eval (ref model forward pass over num_generations=8
+#       completions per prompt saturates the 22 GB L4).
+# Recommended: export PYTORCH_ALLOC_CONF=expandable_segments:True before launch.
+#
+# Launch with:
+#   PYTORCH_ALLOC_CONF=expandable_segments:True python -m src.train_rlvr_grpo \
+#     --config configs/rlvr_l4.yaml \
+#     --init-from checkpoints/srl_l4_token_8192_merged \
+#     --lora-r 32 \
+#     --lora-alpha 64 \
+#     --output-dir checkpoints/rlvr_l4_token_8192/
+
+model: Qwen/Qwen2.5-3B-Instruct
+data: data/srl_train.jsonl
+output_dir: checkpoints/rlvr_l4_token_8192
+
+# Use most of s1K-1.1 dataset
+max_train_samples: 500
+max_eval_samples: 20
+
+# gradient_accumulation_steps = batch_size / per_device_batch(=1) = 8
+batch_size: 8
+num_generations: 8 # group_size
+
+num_train_epochs: 1
+
+max_new_tokens: 8192
+temperature: 1.0
+
+# reducing LR stabilizes updates with the larger effective batch
+lr: 5.0e-7
+
+clip_epsilon: 0.2
+eps_std: 0.01
+kl_coef: 0.0 # Force KL divergence off
+
+# LoRA config — L4 24 GB has headroom for rank 32
+lora_r: 32
+lora_alpha: 64
+lora_dropout: 0.05
+
+# eval/save frequency
+checkpoint_every: 5
+eval_every: 250 # default 250
+seed: 42
+
+# Use vCPUs for async data prefetch (g2-standard-8 has 8 vCPUs)
+dataloader_num_workers: 4

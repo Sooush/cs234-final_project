@@ -1,6 +1,6 @@
 {
   "description": "Model configuration for comprehensive evaluation based on SRL paper parameters",
-  "base_model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "base_model": "Qwen/Qwen2.5-3B-Instruct",
   "models": {
     "base": {
       "model_name": null,
@@ -9,17 +9,17 @@
     },
     "sft": {
       "model_name": null,
-      "model_path": "checkpoints/sft/step_final",
+      "model_path": "checkpoints/sft_merged",
       "description": "Supervised Fine-Tuning (SFT) model. Uses base_model from config. Update path to your SFT checkpoint."
     },
     "srl": {
       "model_name": null,
-      "model_path": "checkpoints/srl/step_500",
+      "model_path": "checkpoints/srl_l4_token_8192_merged",
       "description": "Supervised Reinforcement Learning (SRL) model. Uses base_model from config. Update path to your SRL checkpoint."
     },
     "srl_rlvr": {
       "model_name": null,
-      "model_path": "checkpoints/srl_rlvr/step_final",
+      "model_path": "checkpoints/rlvr_l4_token_8192_merged",
       "description": "SRL→RLVR pipeline model (SRL then RLVR). Uses base_model from config. Update path to your SRL→RLVR checkpoint."
     }
   },
